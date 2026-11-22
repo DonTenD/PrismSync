@@ -21,12 +21,14 @@ from prism_sync.cli import (
     EXIT_SYNC,
     EXIT_USAGE,
     EXIT_VERSION,
+    ConnectionOptions,
     Console,
     ProfileSelectionError,
     build_parser,
     build_selection,
     main,
     select_profile,
+    validate_connection,
 )
 from prism_sync.models import (
     CatalogAsset,
@@ -83,7 +85,8 @@ class _FakeClient:
 
     instances: ClassVar[list[_FakeClient]] = []
 
-    def __init__(self) -> None:
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = dict(kwargs)
         self.closed = False
         self.entered = False
         _FakeClient.instances.append(self)
@@ -107,9 +110,10 @@ def _patch_sync(
     _FakeClient.instances = []
     recorded: dict[str, object] = {}
 
-    def fake_resolve(profile: VersionProfile) -> str:
+    def fake_resolve(profile: VersionProfile, **kwargs: object) -> str:
         recorded["profile"] = profile
-        if isinstance(remote, Exception):
+        recorded["resolve_kwargs"] = dict(kwargs)
+        if isinstance(remote, BaseException):
             raise remote
         return remote
 
@@ -1167,3 +1171,686 @@ class TestOptionForwarding:
 
         assert code == EXIT_USAGE
         assert "invalid filter" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Batch 1: resource version passthrough and connection options
+# --------------------------------------------------------------------------
+
+VALID_VERSION = "20006500@Y/Hfn4F3ipto1cz9Xl5Djro="
+
+
+class TestResourceVersionPassthrough:
+    """``--resource-version`` skips gRPC and the profile lookup."""
+
+    def test_version_is_forwarded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The supplied version reaches ``resolve_remote_version``."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert code == 0
+        assert recorded["resolve_kwargs"].get("resource_version") == VALID_VERSION
+
+    def test_no_profile_works_without_one(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """Omitting --profile keeps a direct version usable on its own."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+                "--game-version",
+                "9.9.9",
+                "--verbose",
+            ]
+        )
+
+        assert code == 0
+        assert "profile" in recorded
+        assert "skipping the profile lookup" in capsys.readouterr().err
+
+    def test_missing_profile_is_not_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """An explicitly given but absent profile is still an error."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile",
+                str(tmp_path / "does-not-exist.json"),
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert code == EXIT_PROFILE
+        assert "profile file not found" in capsys.readouterr().err
+        assert _FakeClient.instances == []
+
+    def test_game_version_used_for_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--game-version`` fills the profile the CRC is derived from."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+                "--game-version",
+                "9.9.9",
+            ]
+        )
+
+        profile = recorded["profile"]
+        assert isinstance(profile, VersionProfile)
+        assert profile.game_version == "9.9.9"
+
+    def test_invalid_version_is_usage_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """A malformed version is rejected with exit code 2."""
+        _patch_sync(monkeypatch, _outcome(), remote=ValueError("bad version"))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                "not-a-version",
+            ]
+        )
+
+        assert code == EXIT_USAGE
+        assert "invalid resource version" in capsys.readouterr().err
+
+    def test_grc_is_never_called(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real gRPC helper must not run when a version is supplied."""
+        import prism_sync.version as version_module
+
+        called: list[object] = []
+        monkeypatch.setattr(
+            version_module, "fetch_resource_version", lambda *a, **k: called.append(a)
+        )
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert called == []
+
+    def test_real_resolution_skips_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``resolve_remote_version`` short-circuits without opening a channel."""
+        import grpc
+
+        def boom(*a: object, **k: object) -> None:
+            raise AssertionError("gRPC must not be used")
+
+        monkeypatch.setattr(grpc, "secure_channel", boom)
+        from prism_sync.version import resolve_remote_version
+
+        empty = VersionProfile(game_version="", version_hash="")
+        assert resolve_remote_version(empty, resource_version=VALID_VERSION) == (
+            VALID_VERSION
+        )
+
+
+class TestHttpOptions:
+    """HTTP overrides reach ``HttpClient`` and nothing else changes."""
+
+    def test_defaults_are_not_overridden(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No flags means no keyword arguments are passed."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert _FakeClient.instances[0].kwargs == {}
+
+    def test_each_option_is_forwarded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every connection flag lands in the client constructor."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--connect-timeout",
+                "3.5",
+                "--read-timeout",
+                "120",
+                "--retries",
+                "7",
+                "--base-url",
+                "https://cdn.example.test",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        kwargs = _FakeClient.instances[0].kwargs
+        assert kwargs["connect_timeout"] == 3.5
+        assert kwargs["read_timeout"] == 120.0
+        assert kwargs["retries"] == 7
+        assert kwargs["base_url"] == "https://cdn.example.test"
+
+    def test_no_proxy_sets_trust_env_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--no-proxy`` maps onto ``trust_env=False``."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--no-proxy",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert _FakeClient.instances[0].kwargs["trust_env"] is False
+
+    @pytest.mark.parametrize("value", ["0", "-1", "-0.5"])
+    def test_non_positive_timeout_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Timeouts must be positive."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(["sync", "--all", "--output", "out", "--read-timeout", value])
+
+        assert code == EXIT_USAGE
+        assert _FakeClient.instances == []
+
+    def test_negative_retries_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--retries`` must be non-negative."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        assert main(["sync", "--all", "--output", "out", "--retries", "-1"]) == (
+            EXIT_USAGE
+        )
+
+    @pytest.mark.parametrize(
+        "url", ["not-a-url", "ftp://x/y", "//host/path", "https://"]
+    )
+    def test_invalid_base_url_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str
+    ) -> None:
+        """A base URL must be an absolute http(s) URL with a host."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        assert main(["sync", "--all", "--output", "out", "--base-url", url]) == (
+            EXIT_USAGE
+        )
+        assert _FakeClient.instances == []
+
+
+class TestGrpcOptions:
+    """gRPC overrides are forwarded, and can be omitted."""
+
+    def test_defaults_are_not_overridden(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without flags no gRPC keyword arguments are passed."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        path = _write(tmp_path, "p.json", PROFILE_OK)
+        main(["sync", "--all", "--output", "out", "--profile", str(path)])
+
+        kwargs = recorded["resolve_kwargs"]
+        assert kwargs.get("resource_version") is None
+        assert "timeout" not in kwargs
+        assert "attempts" not in kwargs
+
+    def test_timeout_and_attempts_forwarded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--grpc-timeout`` and ``--grpc-attempts`` reach the resolver."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--grpc-timeout",
+                "4.5",
+                "--grpc-attempts",
+                "5",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        kwargs = recorded["resolve_kwargs"]
+        assert kwargs["timeout"] == 4.5
+        assert kwargs["attempts"] == 5
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_non_positive_grpc_timeout_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """gRPC timeouts must be positive."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        assert main(["sync", "--all", "--output", "out", "--grpc-timeout", value]) == (
+            EXIT_USAGE
+        )
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_non_positive_grpc_attempts_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """gRPC attempts must be at least one."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        assert main(["sync", "--all", "--output", "out", "--grpc-attempts", value]) == (
+            EXIT_USAGE
+        )
+
+
+class TestConnectionOptionsHelper:
+    """Direct unit tests for the small helper objects."""
+
+    def test_client_kwargs_empty_by_default(self) -> None:
+        """No overrides means no client kwargs."""
+        assert ConnectionOptions().client_kwargs() == {}
+        assert ConnectionOptions().version_kwargs() == {}
+
+    def test_no_proxy_only(self) -> None:
+        """``no_proxy`` maps to ``trust_env``."""
+        assert ConnectionOptions(no_proxy=True).client_kwargs() == {"trust_env": False}
+
+    @pytest.mark.parametrize(
+        "opts",
+        [
+            ConnectionOptions(connect_timeout=0),
+            ConnectionOptions(read_timeout=-1),
+            ConnectionOptions(retries=-1),
+            ConnectionOptions(grpc_timeout=0),
+            ConnectionOptions(grpc_attempts=0),
+            ConnectionOptions(base_url="nope"),
+        ],
+    )
+    def test_validate_connection_rejects(self, opts: ConnectionOptions) -> None:
+        """Bad values produce a message."""
+        assert validate_connection(opts) is not None
+
+    def test_validate_connection_accepts(self) -> None:
+        """Sane values pass."""
+        assert (
+            validate_connection(
+                ConnectionOptions(
+                    base_url="https://cdn.example.test",
+                    connect_timeout=1.0,
+                    read_timeout=2.0,
+                    retries=0,
+                    grpc_timeout=1.0,
+                    grpc_attempts=1,
+                )
+            )
+            is None
+        )
+
+
+class TestBatch1Combinations:
+    """The new flags cooperate with the existing ones."""
+
+    def test_with_profile_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--profile-name`` still selects a profile."""
+        path = _write(
+            tmp_path,
+            "multi.json",
+            {
+                "profiles": {
+                    "a": {"gameVersion": "1", "versionHash": "ha"},
+                    "b": {"gameVersion": "2", "versionHash": "hb"},
+                }
+            },
+        )
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile",
+                str(path),
+                "--profile-name",
+                "b",
+                "--retries",
+                "2",
+            ]
+        )
+
+        profile = recorded["profile"]
+        assert isinstance(profile, VersionProfile)
+        assert profile.game_version == "2"
+        assert _FakeClient.instances[0].kwargs["retries"] == 2
+
+    def test_with_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Selection filters still apply."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--output",
+                "out",
+                "--types",
+                "txt",
+                "--max-size",
+                "4KB",
+                "--read-timeout",
+                "30",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        selection = recorded["selection"]
+        assert selection is not None
+        assert selection.types == frozenset({"txt"})
+        assert _FakeClient.instances[0].kwargs["read_timeout"] == 30.0
+
+    def test_with_all_and_resource_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--all`` plus a direct version keeps the whole catalog."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=3))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+                "--no-proxy",
+            ]
+        )
+
+        assert code == 0
+        selection = recorded["selection"]
+        assert selection is not None
+        assert selection.active is False
+        assert _FakeClient.instances[0].kwargs == {"trust_env": False}
+
+
+# --------------------------------------------------------------------------
+# Batch 1 follow-up: profile handling with --resource-version
+# --------------------------------------------------------------------------
+
+
+class TestProfileWithResourceVersion:
+    """Explicit profile flags are validated, never silently ignored."""
+
+    def test_explicit_valid_profile_is_validated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """A good profile file is read even though gRPC is skipped."""
+        path = _write(tmp_path, "p.json", PROFILE_OK)
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile",
+                str(path),
+                "--resource-version",
+                VALID_VERSION,
+                "--verbose",
+            ]
+        )
+
+        assert code == 0
+        assert "validated the supplied profile" in capsys.readouterr().err
+        profile = recorded["profile"]
+        assert isinstance(profile, VersionProfile)
+        assert profile.game_version == "9.9.9"
+
+    def test_unknown_profile_name_is_not_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """``--profile-name`` pointing nowhere is an error."""
+        path = _write(
+            tmp_path,
+            "multi.json",
+            {
+                "profiles": {
+                    "a": {"gameVersion": "1", "versionHash": "ha"},
+                    "b": {"gameVersion": "2", "versionHash": "hb"},
+                }
+            },
+        )
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile",
+                str(path),
+                "--profile-name",
+                "nope",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert code == EXIT_PROFILE
+        assert "unknown profile" in capsys.readouterr().err
+        assert _FakeClient.instances == []
+
+    def test_profile_name_only_without_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--profile-name`` alone still requires the default lookup."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile-name",
+                "x",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        # The default lookup finds no file in a clean environment.
+        assert code == EXIT_PROFILE
+
+    def test_game_version_overrides_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--game-version`` wins over the profile's value."""
+        path = _write(tmp_path, "p.json", PROFILE_OK)
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile",
+                str(path),
+                "--resource-version",
+                VALID_VERSION,
+                "--game-version",
+                "7.7.7",
+            ]
+        )
+
+        profile = recorded["profile"]
+        assert isinstance(profile, VersionProfile)
+        assert profile.game_version == "7.7.7"
+
+    def test_profile_game_version_used_when_flag_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without ``--game-version`` the profile's value is kept."""
+        path = _write(tmp_path, "p.json", PROFILE_OK)
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--profile",
+                str(path),
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        profile = recorded["profile"]
+        assert isinstance(profile, VersionProfile)
+        assert profile.game_version == "9.9.9"
+
+
+class TestMissingGameVersion:
+    """A missing game version produces a clear warning, not a hard error."""
+
+    def test_warning_when_absent(self, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+        """The run continues but warns about the empty game version."""
+        recorded = _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+            ]
+        )
+
+        assert code == 0
+        assert "no --game-version given" in capsys.readouterr().err
+        profile = recorded["profile"]
+        assert isinstance(profile, VersionProfile)
+        assert profile.game_version == ""
+
+    def test_no_warning_when_present(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """Supplying ``--game-version`` silences the warning."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+                "--game-version",
+                "9.9.9",
+            ]
+        )
+
+        assert "no --game-version given" not in capsys.readouterr().err
+
+    def test_quiet_suppresses_the_warning(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """``--quiet`` hides the warning but keeps the run working."""
+        _patch_sync(monkeypatch, _outcome(downloaded=1))
+
+        code = main(
+            [
+                "sync",
+                "--all",
+                "--output",
+                "out",
+                "--resource-version",
+                VALID_VERSION,
+                "--quiet",
+            ]
+        )
+
+        assert code == 0
+        assert "no --game-version given" not in capsys.readouterr().err
