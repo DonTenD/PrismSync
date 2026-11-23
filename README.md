@@ -8,6 +8,19 @@
 
 PrismSync 首先是一个 Python 库，其次才是 CLI 工具。两者共享同一套业务实现。
 
+## 主要能力
+
+| 能力 | 入口 |
+|---|---|
+| 完整资源同步（增量、续传、校验、原子写入） | `prism_sync.sync_if_needed()` / `prism-sync sync` |
+| 只读版本检查 | `--check` |
+| 同步预演（预计下载量与磁盘余量） | `--dry-run` |
+| 按资源类型统计 | `--list-types` |
+| 从 Android 设备读取 `versionHash` 并写入 profile | `profile import-device` |
+
+只读命令不会下载实际资源，也不会写入 `.prism-version.json`、`sync-state.json` 或 Catalog 缓存。
+`--check` 不访问 Catalog；`--dry-run` / `--list-types` 会读取已有 Catalog 缓存，缓存缺失时在线获取但不回写。
+
 ## 环境要求
 
 - Python >= 3.11（开发环境使用 3.11，见 `.python-version`）
@@ -562,7 +575,37 @@ uv run python -m pytest                  # 测试
 
 ## 项目状态
 
-项目处于早期开发阶段（0.1.0）。Python 库与 `prism-sync sync` 已能完成资源同步；剪裁（prune）、dry-run、MasterData 与本地化等功能尚未迁移。
+当前版本 **0.2.0**。Python 库与 `prism-sync` 命令行工具已能完成完整资源同步，
+并提供只读诊断（`--check` / `--dry-run` / `--list-types`）与 Android 版本接入
+（`profile import-device`）。
+
+尚未迁移：剪裁（`--prune`）、MasterData 与本地化。
+
+### 真实环境验证情况
+
+以下数据来自对游戏版本 **2.20.0** 的完整同步实测，只描述这一次的结果，
+**不代表其他版本、其他 Catalog 布局或未来资源目录**，也不是网络流量或性能基准：
+
+| 项 | 结果 |
+|---|---|
+| Catalog 条目 | 194,507（3 个 Catalog 树） |
+| 全量同步 | 194,507 / 194,507 成功，0 失败 |
+| 落盘资源 | 26,220,322,693 B |
+| 独立 SHA-256 校验 | 194,507 / 194,507 匹配，缺失/多余/不符均为 0 |
+| 分类型验收 | JSON、USM、PNG 各自完成真实同步 |
+| 断点续传 | USM 单文件中断后续传，确认 `Range` 非零偏移与 `206` 响应 |
+
+各资源类型的落盘体积与 Catalog 记录并不总是一致：多数类型是原样透传或
+仅剥离固定前缀。`json` 类型的条目包含 `RawLz4Compressed`、`RawEncrypted`
+和 `BundlePaddedStart` 等 ResourceType：
+
+- `RawLz4Compressed` —— LZ4 解压；
+- `RawEncrypted` —— 先 AES 解密，再 LZ4 解压；
+- `BundlePaddedStart` —— 剥离固定的 4 字节前缀。
+
+其中含压缩的条目在解压后体积明显增加。本机对 2.20.0 的全部 `json` 条目
+实测，落盘总体积约为 Catalog 记录的 5.2 倍。该比例是全部 `json` 条目的
+聚合结果，并非单个文件的膨胀比例，也不适用于其他资源类型或游戏版本。
 
 ## 许可证
 

@@ -1,6 +1,6 @@
 [project]
 name = "prism-sync"
-version = "0.1.0"
+version = "0.2.0"
 description = "Check, download, cache, and synchronize game resources with a Python library and CLI."
 readme = "README.md"
 authors = [
