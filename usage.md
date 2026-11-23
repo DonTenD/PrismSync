@@ -179,7 +179,15 @@ selection = Selection(types=frozenset({"txt"}), max_size=64 * 1024)
 
 以下条件全部由用户自己准备，PrismSync 不会代劳：
 
-- 单独安装 [PrismVersionHashExtractor](https://github.com/)（或等价工具）。
+- 单独安装 [PrismVersionHashExtractor](https://github.com/DonTenD/PrismVersionHashExtractor)（或等价工具），
+  并从源码初始化：
+
+  ```bash
+  git clone https://github.com/DonTenD/PrismVersionHashExtractor.git
+  cd PrismVersionHashExtractor
+  uv sync
+  ```
+
 - Android 设备已用 USB 连接，`adb devices` 能看到它。
 - 设备**已 root**，并且 `frida-server` 已在运行。
   **未 root 的设备无法使用**：Frida 在 jailed Android 上只能注入 debuggable 应用。
