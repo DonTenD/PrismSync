@@ -37,15 +37,35 @@ Android 设备读取，PrismSync 也提供了配套的调用入口（详见使�
 
 - Python >= 3.11
 - [uv](https://docs.astral.sh/uv/)（依赖管理与命令执行）
+- Git
 
-## 安装
+## 获取与初始化
+
+克隆后在**项目根目录**执行初始化：
 
 ```bash
-# 作为依赖安装
-uv add prism-sync
-
-# 在本地仓库中同步依赖
+git clone https://github.com/DonTenD/PrismSync.git
+cd PrismSync
 uv sync
+```
+
+`uv sync` 会创建 `.venv`、安装依赖，并以可编辑模式安装本项目本身，
+因此在项目根目录即可使用 `uv run prism-sync`。
+
+如需在任意目录直接调用 CLI，激活虚拟环境后即可使用 `prism-sync`：
+
+```bash
+# Windows PowerShell
+.venv/Scripts/Activate.ps1
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+如需在其他项目中把 PrismSync 作为库引入，请引用本地路径：
+
+```bash
+uv add --editable ../PrismSync
 ```
 
 ## 快速开始

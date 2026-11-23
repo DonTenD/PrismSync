@@ -26,15 +26,72 @@ PrismSync 首先是一个 Python 库，其次才是 CLI 工具。两者共享同
 
 - Python >= 3.11（开发环境使用 3.11，见 `.python-version`）
 - [uv](https://docs.astral.sh/uv/) 用于依赖管理与命令执行
+- Git
 
-## 安装
+## 获取与初始化
+
+### 1. 克隆仓库
 
 ```bash
-# 作为依赖安装
-uv add prism-sync
+git clone https://github.com/DonTenD/PrismSync.git
+cd PrismSync
+```
 
-# 在本地开发环境中同步依赖
+### 2. 在项目根目录初始化
+
+```bash
 uv sync
+```
+
+这一步会：
+
+- 按 `.python-version` 准备 Python 解释器（若尚未安装）；
+- 创建 `.venv/` 并安装 `pyproject.toml` 与 `uv.lock` 锁定的依赖；
+- 以**可编辑模式**安装本项目自身，因此项目根目录下的修改会立即生效。
+
+### 3. 验证
+
+```bash
+uv run prism-sync --help
+uv run python -c "import prism_sync; print(prism_sync.__version__)"
+```
+
+`uv run` 会在项目虚拟环境中执行命令，不必手动激活环境。
+
+### 找不到 `prism-sync` 命令时
+
+`prism-sync` 只存在于本项目的 `.venv` 中，并未安装到全局 PATH。
+两种方式都能调用它：
+
+```bash
+# 推荐：在项目根目录通过 uv run 调用
+uv run prism-sync sync --help
+
+# 或先激活虚拟环境，再直接使用命令
+# Windows PowerShell
+.venv/Scripts/Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
+
+prism-sync sync --help
+```
+
+Windows 下也可直接调用可执行文件：`.venv/Scripts/prism-sync.exe`。
+
+### 在其他项目中使用本库
+
+请引用本地路径：
+
+```bash
+# 在另一个项目目录中执行
+uv add --editable /path/to/PrismSync
+```
+
+或在该项目的 `pyproject.toml` 中声明：
+
+```toml
+[tool.uv.sources]
+prism-sync = { path = "../PrismSync", editable = true }
 ```
 
 ## Python 库
