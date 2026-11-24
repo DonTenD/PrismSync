@@ -29,6 +29,7 @@ Android 设备读取，PrismSync 也提供了配套的调用入口（详见使�
 | 同步预演（预计下载量与磁盘余量） | `--dry-run` |
 | 按资源类型统计 | `--list-types` |
 | 从 Android 设备读取 `versionHash` 并写入 profile | `profile import-device` |
+| 手动输入 `versionHash` 与游戏版本 | `profile add` / 直接运行 `prism-sync` |
 
 只读命令不会下载实际资源，也不会写入 `.prism-version.json`、`sync-state.json`
 或 Catalog 缓存。

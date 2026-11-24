@@ -32,6 +32,9 @@ coverage.xml
 !.env.example
 *.local.toml
 
+# Profile documents hold this machine's game version and version hash
+/version_profiles.json
+
 # Editors and OS files
 .idea/
 .vscode/
@@ -42,3 +45,6 @@ Thumbs.db
 .cache/
 .local/
 prism-sync-data/
+
+# Default output directory used by the interactive menu and CLI examples
+/assets/

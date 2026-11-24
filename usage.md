@@ -17,6 +17,7 @@ PrismSync 首先是一个 Python 库，其次才是 CLI 工具。两者共享同
 | 同步预演（预计下载量与磁盘余量） | `--dry-run` |
 | 按资源类型统计 | `--list-types` |
 | 从 Android 设备读取 `versionHash` 并写入 profile | `profile import-device` |
+| 手动输入 `versionHash` 与游戏版本 | `profile add` |
 
 只读命令不会下载实际资源，也不会写入 `.prism-version.json`、`sync-state.json`
 或 Catalog 缓存。`--check` 不访问 Catalog；`--dry-run` / `--list-types` 会读取
@@ -401,7 +402,162 @@ Catalog 的 label CRC。
 }
 ```
 
+### 交互式写入：profile add
+
+手写 JSON 容易出错，可以用 `profile add` 逐步输入：
+
+```bash
+uv run prism-sync profile add --profile ./version_profiles.json
+```
+
+执行后会依次提示：
+
+1. `gameVersion`（已有 profile 时会给出建议值，回车即采纳）；
+2. `versionHash`——若文档里已有哈希，会列出来让你按编号选用，
+   也可以选择「enter a new hash」重新输入；
+3. 确认写入。
+
+```text
+$ uv run prism-sync profile add --profile ./version_profiles.json
+gameVersion [2.19.1]: 2.20.0
+prism-sync profile add: known hashes:
+prism-sync profile add:   1. f116097fd1d91dce705ad7604c3d044210389be8
+prism-sync profile add:   2. enter a new hash
+choose 1-2 [1]: 2
+versionHash: d157435ece8674102c7fbd4867ce593e26cc5d22
+prism-sync profile add: game version: 2.20.0
+prism-sync profile add: version hash: d157435ece8674102c7fbd4867ce593e26cc5d22
+prism-sync profile add: profile name: 2.20.0
+write profile '2.20.0' in ./version_profiles.json? [y/N] y
+prism-sync profile add: wrote profile '2.20.0' to ./version_profiles.json
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--profile FILE` | 要写入的 profile 文档（不存在则创建），必填 |
+| `--name NAME` | profile 名，默认用输入的游戏版本 |
+| `--game-version VERSION` | 直接给出游戏版本，跳过该提示 |
+| `--version-hash HASH` | 直接给出哈希，跳过该提示 |
+| `--replace` | 允许覆盖同名 profile |
+| `--yes` | 跳过写入前的确认 |
+
+行为约束：
+
+- 哈希必须为 **40 位十六进制**，大小写均可，存储时统一为小写。
+- 游戏版本不能为空；空输入视为放弃并退出（退出码 `2`），文件不被修改。
+- 同名 profile 已存在时需 `--replace`，否则拒绝（退出码 `3`）。
+- 输入中断（`Ctrl-C` 或 `Ctrl-D`）等同放弃，不会留下半截文件。
+- 已有的 `default` 不会被改动；首个 profile 会同时成为默认项。
+
 ## 命令行
+
+### 无参数启动：交互菜单
+
+直接运行 `prism-sync`（不带任何子命令）时，会在交互式终端上列出可用操作：
+
+```text
+$ uv run prism-sync
+PrismSync - choose an action:
+
+  1. sync            synchronize resources into an output directory
+  2. check           compare the remote version with the local marker (read-only)
+  3. dry-run         show what a sync would add, change or remove (read-only)
+  4. list-types      print per-type catalog totals (read-only)
+  5. profile-add     enter a gameVersion and versionHash
+  6. profile-import  read the versionHash from a connected Android device
+  q. quit
+
+select 1-6: 5
+profile document [./version_profiles.json]:
+gameVersion: 2.20.0
+versionHash: d157435ece8674102c7fbd4867ce593e26cc5d22
+profile name [2.20.0]:
+profile '2.20.0' was written to ./version_profiles.json
+```
+
+输入编号后，该操作所需的参数会被逐项询问（方括号里是默认值，直接回车即采纳）。
+
+| 菜单项 | 会问什么 |
+|---|---|
+| `sync` | 输出目录、profile 文档、gameVersion、versionHash |
+| `check` | 输出目录、profile 文档、gameVersion、versionHash |
+| `dry-run` | 输出目录、profile 文档、gameVersion、versionHash |
+| `list-types` | 输出目录、profile 文档、gameVersion、versionHash |
+| `profile-add` | profile 文档、gameVersion、versionHash、profile 名 |
+| `profile-import` | profile 文档、提取器项目目录 |
+
+#### 默认路径
+
+`output directory` 与 `profile document` 的默认值都是**项目根目录下的绝对路径**，
+而不是当前工作目录：
+
+```text
+output directory [<project root>/assets]:
+profile document [<project root>/version_profiles.json]:
+```
+
+直接回车即采用该路径；文件/目录不存在时会按需创建。这样无论从哪个目录启动
+`prism-sync`，同步结果都落在同一个位置。
+
+#### 已存在时的提示
+
+采用默认值之前会先检查该位置的状态，有内容时打印一行提示（不会阻止继续）：
+
+| 情况 | 提示 |
+|---|---|
+| 目录不存在 | 无提示 |
+| 目录已存在但为空 | `... already exists (empty)` |
+| 目录非空且没有 `sync-state.json` | `... already exists and is not empty` |
+| 目录含有同步记录 | `... already holds a sync (N recorded files, resourceVersion ...)` |
+| state 文件损坏 | `... already contains a sync state (unreadable)` |
+| profile 文件已存在 | `... already holds N profile(s): a, b` |
+
+看到提示后可以回车沿用，也可以输入另一个路径。若换成别的路径，同样会检查该路径。
+
+已有的 profile 还会被用作建议值：`gameVersion` 的默认值取文档中最近的一个，
+`versionHash` 会编号列出来供选取，输入新编号则可重新输入。
+
+#### 取消与返回
+
+在任意一步回车放弃，或按 `Ctrl-C` / `Ctrl-D`，都会**回到菜单**而不是退出程序，
+可以重新选择。只有菜单里的 `q` 才会结束会话。
+
+```text
+select 1-6: 2
+prism-sync sync: no gameVersion is known yet, please type one
+gameVersion:            <- 直接回车
+prism-sync sync: warning: cancelled; back to the menu
+
+PrismSync - choose an action:      <- 菜单再次出现
+```
+
+`gameVersion` 是**必需**的（它参与根 Catalog 的 CRC 计算），当文档里还没有任何
+profile 时无法用回车跳过，必须先输入一个版本号。
+
+#### 输入的 profile 会被保存
+
+`sync` / `check` / `dry-run` / `list-types` 只需要一个 profile，但输完就会问一句：
+
+```text
+save this profile to C:\...ersion_profiles.json? [y/N] y
+prism-sync sync: wrote profile '2.20.0' to C:\...ersion_profiles.json
+```
+
+保存后，下一次选任何命令都会自动带出 `gameVersion` 与已列出的 `versionHash`，
+不必重新输入 40 位哈希。
+
+如果不保存，值只在本次操作内有效，回到菜单后仍需重新输入。
+
+已存在的条目不会被静默改写：
+
+| 情况 | 行为 |
+|---|---|
+| 文件里已有同版本、同哈希 | 不再询问，也不重写 |
+| 文件里已有同版本、不同哈希 | 提示「different hash」并保持文件不变 |
+| 文件里没有该版本 | 询问后追加，已有条目与 `default` 都保留 |
+
+> 菜单**只在交互式终端**且**没有传入任何参数**时出现。重定向输入或传入子命令时
+> （例如脚本、CI）仍然是原来的 argparse 行为，不会意外阻塞。
 
 安装后 `prism-sync` 会出现在 PATH 中；在仓库内也可以用 `uv run prism-sync` 调用。
 

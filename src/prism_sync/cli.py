@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .version import (
     VersionError,
     check_version,
     load_profiles,
+    project_root,
     resolve_profiles_path,
     resolve_remote_version,
     save_profiles,
@@ -431,6 +433,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-remote",
         action="store_true",
         help="also query gRPC with the imported hash and show the resource version",
+    )
+
+    add_profile = profile_commands.add_parser(
+        "add",
+        help="enter a game version and version hash interactively",
+        description=(
+            "Prompt for the game version and versionHash, then store them in "
+            "the profile document. Values can also be passed as options, which "
+            "skips the prompts."
+        ),
+    )
+    add_profile.add_argument(
+        "--profile",
+        metavar="FILE",
+        required=True,
+        help="profile document to update (created when missing)",
+    )
+    add_profile.add_argument(
+        "--name",
+        metavar="NAME",
+        default=None,
+        help="profile name to write (default: the game version)",
+    )
+    add_profile.add_argument(
+        "--game-version",
+        metavar="VERSION",
+        default=None,
+        help="game version; prompts when omitted",
+    )
+    add_profile.add_argument(
+        "--version-hash",
+        metavar="HASH",
+        default=None,
+        help="40 character version hash; prompts when omitted",
+    )
+    add_profile.add_argument(
+        "--replace",
+        action="store_true",
+        help="overwrite an existing profile with the same name",
+    )
+    add_profile.add_argument(
+        "--yes",
+        action="store_true",
+        help="write without asking for confirmation",
     )
     return parser
 
@@ -1025,6 +1071,523 @@ def _confirm(prompt: str) -> bool:
     return answer.strip().lower().startswith("y")
 
 
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _prompt_line(prompt: str, default: str | None = None) -> str | None:
+    """Read one line from the terminal.
+
+    Args:
+        prompt: Text shown before the cursor.
+        default: Value returned when the user submits an empty line.
+
+    Returns:
+        The typed value, or ``None`` when input was cancelled.
+    """
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    answer = answer.strip()
+    if not answer:
+        return default
+    return answer
+
+
+def _prompt_candidates(console: Console, known: list[str]) -> str | None:
+    """Offer the known hashes so the user can pick one or type a new value.
+
+    Returns:
+        The chosen hash, or ``None`` when input was cancelled.
+    """
+    if not known:
+        return _prompt_line("versionHash")
+
+    console.status("known hashes:")
+    for index, value in enumerate(known, 1):
+        console.status(f"  {index}. {value}")
+    console.status(f"  {len(known) + 1}. enter a new hash")
+
+    while True:
+        choice = _prompt_line(f"choose 1-{len(known) + 1}", default="1")
+        if choice is None:
+            return None
+        if choice.isdigit():
+            number = int(choice)
+            if 1 <= number <= len(known):
+                return known[number - 1]
+            if number == len(known) + 1:
+                return _prompt_line("versionHash")
+        console.error(f"invalid choice: {choice!r}")
+
+
+#: Menu entries shown when the CLI is started without arguments.
+_MENU: tuple[tuple[str, str, str], ...] = (
+    ("sync", "synchronize resources into an output directory", "sync"),
+    ("check", "compare the remote version with the local marker (read-only)", "check"),
+    ("dry-run", "show what a sync would add, change or remove (read-only)", "dry_run"),
+    ("list-types", "print per-type catalog totals (read-only)", "list_types"),
+    ("profile-add", "enter a gameVersion and versionHash", "profile_add"),
+    (
+        "profile-import",
+        "read the versionHash from a connected Android device",
+        "profile_import",
+    ),
+)
+
+
+def _print_menu() -> None:
+    """Show the interactive menu on standard output."""
+    print("PrismSync - choose an action:", file=sys.stdout)
+    print("", file=sys.stdout)
+    for index, (label, description, _action) in enumerate(_MENU, 1):
+        print(f"  {index}. {label:<15} {description}", file=sys.stdout)
+    print("  q. quit", file=sys.stdout)
+    print("", file=sys.stdout)
+
+
+def _ask(prompt: str, *, default: str | None = None) -> str | None:
+    """Read one answer, returning ``None`` when the user cancels.
+
+    Args:
+        prompt: Text shown to the user.
+        default: Value used when the answer is empty.
+
+    Returns:
+        The trimmed answer, or ``None`` on EOF / Ctrl-C.
+    """
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ")
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stdout)
+        return None
+    answer = answer.strip()
+    return answer or default
+
+
+def _menu_pick() -> str | None:
+    """Prompt for a menu entry and return its action name."""
+    while True:
+        _print_menu()
+        choice = _ask(f"select 1-{len(_MENU)}")
+        if choice is None or choice.lower() in ("q", "quit", "exit"):
+            return None
+        if choice.isdigit():
+            number = int(choice)
+            if 1 <= number <= len(_MENU):
+                return _MENU[number - 1][2]
+        print(f"invalid choice: {choice!r}", file=sys.stdout)
+
+
+def _project_dir() -> Path:
+    """Return the project root used for menu defaults.
+
+    ``project_root()`` resolves to the checkout that contains this package, so
+    the default paths do not depend on the current working directory.
+    """
+    return project_root()
+
+
+def _default_output_dir() -> str:
+    """Return the default output directory as an absolute path."""
+    return str(_project_dir() / "assets")
+
+
+def _default_profile_path() -> str:
+    """Return the default profile document as an absolute path."""
+    return str(_project_dir() / "version_profiles.json")
+
+
+def _describe_existing_output(path: Path) -> str | None:
+    """Return a short note when ``path`` already holds a previous sync."""
+    if not path.is_dir():
+        return None
+    state = path / DEFAULT_STATE_FILE
+    if state.is_file():
+        try:
+            data = json.loads(state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return f"{path} already contains a sync state (unreadable)"
+        files = data.get("files")
+        count = len(files) if isinstance(files, dict) else 0
+        version = data.get("resourceVersion")
+        detail = f"{count} recorded files" if count else "no recorded files"
+        if isinstance(version, str) and version:
+            detail += f", resourceVersion {version}"
+        return f"{path} already holds a sync ({detail})"
+    if any(path.iterdir()):
+        return f"{path} already exists and is not empty"
+    return f"{path} already exists (empty)"
+
+
+def _describe_existing_profile(path: Path, console: Console) -> str | None:
+    """Return a short note when ``path`` already holds profiles."""
+    if not path.is_file():
+        return None
+    known = _load_existing_profiles(str(path), console)
+    if not known:
+        return f"{path} already exists"
+    names = ", ".join(sorted(known))
+    return f"{path} already holds {len(known)} profile(s): {names}"
+
+
+def _menu_ask_path(console: Console) -> str | None:
+    """Ask for the output directory, defaulting to ``./assets``."""
+    default = _default_output_dir()
+    note = _describe_existing_output(Path(default))
+    if note is not None:
+        console.warning(note)
+    answer = _ask("output directory", default=default)
+    if answer is None or not answer.strip():
+        console.warning("cancelled; nothing was changed")
+        return None
+    chosen = Path(answer.strip())
+    if chosen != Path(default):
+        other = _describe_existing_output(chosen)
+        if other is not None:
+            console.warning(other)
+    return str(chosen)
+
+
+def _offer_profile_save(
+    console: Console,
+    path: str,
+    profile: VersionProfile,
+) -> None:
+    """Store the entered profile so the next action can reuse it.
+
+    The read-only commands only need a profile in memory, so the value would
+    otherwise be lost as soon as the action finishes.  Writing it keeps the
+    document in sync with what the user typed.
+
+    Args:
+        console: Sink for prompts and diagnostics.
+        path: Profile document to write.
+        profile: The values just entered.
+    """
+    target = Path(path)
+    loaded = _load_existing_profiles(path, console) if target.exists() else {}
+    if loaded is None:
+        return
+    existing: dict[str, VersionProfile] = loaded
+    if existing and profile.game_version in existing:
+        if existing[profile.game_version].version_hash == profile.version_hash:
+            return
+        console.status(
+            f"{target} already holds a different hash for "
+            f"{profile.game_version!r}; it was left unchanged"
+        )
+        return
+
+    if not _confirm(f"save this profile to {target}?"):
+        return
+
+    updated = dict(existing)
+    updated[profile.game_version] = profile
+    default_name = _default_of(path) if existing else profile.game_version
+    try:
+        save_profiles(path, updated, default_name)
+    except (OSError, ValueError, VersionError) as exc:
+        console.warning(f"cannot write {path}: {exc}")
+        return
+    console.result(f"wrote profile {profile.game_version!r} to {path}")
+
+
+def _menu_ask_profile(
+    console: Console,
+    path: str,
+    *,
+    previous_version: str | None = None,
+) -> VersionProfile | None:
+    """Ask for a gameVersion and versionHash and return a profile.
+
+    Existing profiles in ``path`` are offered as suggestions so a known value
+    can be reused without typing it again.  ``previous_version`` is used when
+    the document holds nothing usable, so pressing Enter always works.
+
+    Args:
+        console: Sink for prompts and diagnostics.
+        path: Profile document used to look up existing values.
+        previous_version: Game version entered earlier in this session.
+
+    Returns:
+        The profile, or ``None`` when the user cancels or the input is invalid.
+    """
+    known = _load_existing_profiles(path, console)
+    if known is None:
+        return None
+
+    versions = sorted(known)
+    suggested_version = versions[-1] if versions else previous_version
+    if suggested_version:
+        game_version = _ask("gameVersion", default=suggested_version)
+        if game_version is None or not game_version.strip():
+            console.warning("cancelled; back to the menu")
+            return None
+    else:
+        # No stored version to fall back on, so Enter cannot choose one.
+        # Say so instead of treating an empty line as a cancellation.
+        console.status("no gameVersion is known yet, please type one")
+        game_version = _ask("gameVersion")
+        if game_version is None:
+            console.warning("cancelled; back to the menu")
+            return None
+        if not game_version.strip():
+            console.error(
+                "gameVersion is required: it is part of the root catalog CRC. "
+                "Nothing was changed."
+            )
+            return None
+    game_version = game_version.strip()
+
+    version_hash: str | None
+    hashes: list[str] = []
+    for profile in known.values():
+        if profile.version_hash and profile.version_hash not in hashes:
+            hashes.append(profile.version_hash)
+
+    if hashes:
+        console.status("known hashes:")
+        for index, value in enumerate(hashes, 1):
+            console.status(f"  {index}. {value}")
+        console.status(f"  {len(hashes) + 1}. enter a new hash")
+        choice = _ask(f"choose 1-{len(hashes) + 1}", default="1")
+        if choice is None:
+            console.warning("cancelled; nothing was changed")
+            return None
+        if not choice.isdigit() or not 1 <= int(choice) <= len(hashes) + 1:
+            console.error(f"invalid choice: {choice!r}")
+            return None
+        if int(choice) <= len(hashes):
+            version_hash = hashes[int(choice) - 1]
+        else:
+            version_hash = _ask("versionHash")
+    else:
+        version_hash = _ask("versionHash")
+
+    if version_hash is None:
+        console.warning("cancelled; nothing was changed")
+        return None
+    version_hash = version_hash.strip().lower()
+    if not _HASH_RE.match(version_hash):
+        console.error(
+            f"versionHash must be 40 hexadecimal characters, got {version_hash!r}"
+        )
+        return None
+    return VersionProfile(game_version=game_version, version_hash=version_hash)
+
+
+def run_menu() -> int:
+    """Run an interactive menu, used when the CLI gets no arguments.
+
+    Cancelling an action returns to the menu instead of exiting, so a mistyped
+    answer never loses the session.  Only ``q`` leaves.
+
+    Returns:
+        The exit status of the last action, or ``EXIT_USAGE`` when the user
+        quits without running anything.
+    """
+    last_status = EXIT_USAGE
+    previous_version: str | None = None
+
+    while True:
+        matched = _menu_dispatch(previous_version)
+        if matched is None:
+            print("nothing to do", file=sys.stdout)
+            return last_status
+        status, used_version = matched
+        last_status = status
+        if used_version:
+            previous_version = used_version
+
+
+def _menu_dispatch(
+    previous_version: str | None,
+) -> tuple[int, str | None] | None:
+    """Run one menu action.
+
+    Returns:
+        ``(exit status, game version used)``, or ``None`` to leave the menu.
+    """
+    action = _menu_pick()
+    if action is None:
+        return None
+
+    if action == "profile_add":
+        console = Console(command="profile add")
+        default = _default_profile_path()
+        note = _describe_existing_profile(Path(default), console)
+        if note is not None:
+            console.status(note)
+        path = _ask("profile document", default=default)
+        if path is None:
+            return EXIT_USAGE, None
+        path = str(Path(path.strip()))
+        profile = _menu_ask_profile(console, path, previous_version=previous_version)
+        if profile is None:
+            return EXIT_USAGE, None
+        name = _ask("profile name", default=profile.game_version)
+        if name is None:
+            return EXIT_USAGE, None
+        status = run_profile_add(
+            console,
+            profile_path=path,
+            name=name,
+            game_version=profile.game_version,
+            version_hash=profile.version_hash,
+            replace=False,
+            assume_yes=False,
+        )
+        return status, profile.game_version
+
+    console = Console(command="sync")
+
+    if action == "profile_import":
+        default = _default_profile_path()
+        note = _describe_existing_profile(Path(default), console)
+        if note is not None:
+            console.status(note)
+        path = _ask("profile document", default=default)
+        if path is None:
+            return EXIT_USAGE, None
+        path = str(Path(path.strip()))
+        project = _ask("PrismVersionHashExtractor directory")
+        if project is None or not project.strip():
+            console.error("an extractor directory is required")
+            return EXIT_USAGE, None
+        status = run_profile_import(
+            console,
+            profile_path=path,
+            name=None,
+            extractor=["uv", "run", "--project", project.strip(), "prism-version-hash"],
+            timeout=300.0,
+            replace=False,
+            assume_yes=False,
+            check_remote=False,
+        )
+        return status, None
+
+    output = _menu_ask_path(console)
+    if output is None:
+        return EXIT_USAGE, None
+
+    default_doc = _default_profile_path()
+    note = _describe_existing_profile(Path(default_doc), console)
+    if note is not None:
+        console.status(note)
+    doc = _ask("profile document", default=default_doc)
+    if doc is None or not doc.strip():
+        console.warning("cancelled; nothing was changed")
+        return EXIT_USAGE, None
+
+    profile = _menu_ask_profile(
+        console, str(Path(doc.strip())), previous_version=previous_version
+    )
+    if profile is None:
+        return EXIT_USAGE, None
+
+    _offer_profile_save(console, str(Path(doc.strip())), profile)
+
+    if action == "sync":
+        status = run_sync(output, profile, console)
+    elif action == "check":
+        status = run_check(output, profile, console)
+    elif action == "dry_run":
+        status = run_dry_run(output, profile, console)
+    else:
+        status = run_list_types(output, profile, console)
+    return status, profile.game_version
+
+
+def run_profile_add(
+    console: Console,
+    *,
+    profile_path: str,
+    name: str | None,
+    game_version: str | None,
+    version_hash: str | None,
+    replace: bool,
+    assume_yes: bool,
+) -> int:
+    """Collect a game version and version hash from the terminal and store them.
+
+    Missing values are prompted for, so the command works without any options
+    beyond ``--profile``.  Existing profiles are shown so a known hash can be
+    reused with a single keystroke.
+
+    Returns:
+        ``0`` on success, ``2`` for bad input, ``3`` for profile problems.
+    """
+    existing = _load_existing_profiles(profile_path, console)
+    if existing is None:
+        return EXIT_PROFILE
+
+    known_hashes: list[str] = []
+    for profile in existing.values():
+        if profile.version_hash and profile.version_hash not in known_hashes:
+            known_hashes.append(profile.version_hash)
+
+    if game_version is None:
+        defaults = sorted(existing)
+        suggestion = defaults[-1] if defaults else None
+        game_version = _prompt_line("gameVersion", default=suggestion)
+        if game_version is None:
+            console.warning("aborted; the profile document was not changed")
+            return EXIT_USAGE
+    game_version = game_version.strip()
+    if not game_version:
+        console.error("gameVersion must not be empty")
+        return EXIT_USAGE
+
+    if version_hash is None:
+        version_hash = _prompt_candidates(console, known_hashes)
+        if version_hash is None:
+            console.warning("aborted; the profile document was not changed")
+            return EXIT_USAGE
+    version_hash = version_hash.strip()
+    if not _HASH_RE.match(version_hash):
+        console.error(
+            f"versionHash must be 40 hexadecimal characters, got {version_hash!r}"
+        )
+        return EXIT_USAGE
+    version_hash = version_hash.lower()
+
+    profile_name = name or game_version
+    profile = VersionProfile(game_version=game_version, version_hash=version_hash)
+
+    console.result(f"game version: {game_version}")
+    console.result(f"version hash: {version_hash}")
+    console.result(f"profile name: {profile_name}")
+
+    if profile_name in existing and not replace:
+        console.error(
+            f"profile {profile_name!r} already exists in {profile_path}; "
+            "pass --replace to overwrite it"
+        )
+        return EXIT_PROFILE
+
+    if not assume_yes:
+        action = "overwrite" if profile_name in existing else "write"
+        if not _confirm(f"{action} profile {profile_name!r} in {profile_path}?"):
+            console.warning("aborted; the profile document was not changed")
+            return EXIT_USAGE
+
+    updated = dict(existing)
+    updated[profile_name] = profile
+    current_default = _default_of(profile_path) if existing else ""
+    default_name = current_default or profile_name
+    try:
+        save_profiles(profile_path, updated, default_name)
+    except (OSError, ValueError, VersionError) as exc:
+        console.error(f"cannot write {profile_path}: {exc}")
+        return EXIT_PROFILE
+    console.result(f"wrote profile {profile_name!r} to {profile_path}")
+    return 0
+
+
 def run_profile_import(
     console: Console,
     *,
@@ -1315,10 +1878,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command is None:
+        # No arguments: offer a menu on an interactive terminal, but keep the
+        # old help-on-stderr behaviour for scripts and pipelines.
+        if _is_tty(sys.stdin):
+            return run_menu()
         parser.print_help(sys.stderr)
         return EXIT_USAGE
 
     if args.command == "profile":
+        if args.profile_command is None:
+            parser.print_help(sys.stderr)
+            return EXIT_USAGE
+
+        if args.profile_command == "add":
+            console = Console(command="profile add")
+            return run_profile_add(
+                console,
+                profile_path=args.profile,
+                name=args.name,
+                game_version=args.game_version,
+                version_hash=args.version_hash,
+                replace=args.replace,
+                assume_yes=args.yes,
+            )
+
         if args.profile_command != "import-device":
             parser.print_help(sys.stderr)
             return EXIT_USAGE

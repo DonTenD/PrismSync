@@ -784,3 +784,695 @@ class TestCheckRemoteFailureKeepsProfile:
         err = capsys.readouterr().err
         assert "prism-sync profile import-device:" in err
         assert "already saved to" not in err
+
+
+# --------------------------------------------------------------------------
+# profile add: interactive entry
+# --------------------------------------------------------------------------
+
+
+class TestProfileAdd:
+    def _feed(self, monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> None:
+        """Make ``input`` return the given answers in order."""
+        items = iter(answers)
+
+        def fake(prompt: str = "") -> str:
+            try:
+                return next(items)
+            except StopIteration:
+                raise EOFError from None
+
+        monkeypatch.setattr("builtins.input", fake)
+
+    def test_prompts_for_both_values(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["2.20.0", HASH, "y"])
+
+        code = main(["profile", "add", "--profile", str(path)])
+
+        assert code == 0
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["profiles"]["2.20.0"]["gameVersion"] == "2.20.0"
+        assert data["profiles"]["2.20.0"]["versionHash"] == HASH
+        assert "prism-sync profile add:" in capsys.readouterr().err
+
+    def test_options_skip_prompts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["y"])
+
+        code = main(
+            [
+                "profile",
+                "add",
+                "--profile",
+                str(path),
+                "--game-version",
+                "2.20.0",
+                "--version-hash",
+                HASH,
+            ]
+        )
+
+        assert code == 0
+        assert (
+            json.loads(path.read_text(encoding="utf-8"))["profiles"]["2.20.0"][
+                "versionHash"
+            ]
+            == HASH
+        )
+
+    def test_hash_is_lowercased(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["2.20.0", HASH.upper(), "y"])
+
+        main(["profile", "add", "--profile", str(path)])
+
+        assert (
+            json.loads(path.read_text(encoding="utf-8"))["profiles"]["2.20.0"][
+                "versionHash"
+            ]
+            == HASH
+        )
+
+    def test_rejects_a_bad_hash(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["2.20.0", "not-a-hash"])
+
+        code = main(["profile", "add", "--profile", str(path)])
+
+        assert code == cli_module.EXIT_USAGE
+        assert "must be 40 hexadecimal" in capsys.readouterr().err
+        assert not path.exists()
+
+    def test_rejects_an_empty_game_version(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["", HASH])
+
+        code = main(["profile", "add", "--profile", str(path)])
+
+        assert code == cli_module.EXIT_USAGE
+        assert "aborted" in capsys.readouterr().err
+        assert not path.exists()
+
+    def test_offers_existing_hashes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        old = "f116097fd1d91dce705ad7604c3d044210389be8"
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.19.1",
+                "profiles": {"2.19.1": {"gameVersion": "2.19.1", "versionHash": old}},
+            },
+        )
+        self._feed(monkeypatch, ["2.20.0", "1", "y"])
+
+        main(["profile", "add", "--profile", str(path)])
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["profiles"]["2.20.0"]["versionHash"] == old
+        assert old in capsys.readouterr().err
+
+    def test_can_enter_a_new_hash_when_some_exist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        old = "f116097fd1d91dce705ad7604c3d044210389be8"
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.19.1",
+                "profiles": {"2.19.1": {"gameVersion": "2.19.1", "versionHash": old}},
+            },
+        )
+        self._feed(monkeypatch, ["2.20.0", "2", HASH, "y"])
+
+        main(["profile", "add", "--profile", str(path)])
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["profiles"]["2.20.0"]["versionHash"] == HASH
+        assert data["profiles"]["2.19.1"]["versionHash"] == old
+        assert data["default"] == "2.19.1"
+
+    def test_cancel_at_prompt_writes_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, [])
+
+        code = main(["profile", "add", "--profile", str(path)])
+
+        assert code == cli_module.EXIT_USAGE
+        assert not path.exists()
+
+    def test_declining_the_write_keeps_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["2.20.0", HASH, "n"])
+
+        code = main(["profile", "add", "--profile", str(path)])
+
+        assert code == cli_module.EXIT_USAGE
+        assert not path.exists()
+
+    def test_existing_name_needs_replace(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.20.0",
+                "profiles": {
+                    "2.20.0": {"gameVersion": "2.20.0", "versionHash": OTHER_HASH}
+                },
+            },
+        )
+        before = path.read_text(encoding="utf-8")
+        self._feed(monkeypatch, ["2.20.0", "2", HASH])
+
+        code = main(["profile", "add", "--profile", str(path)])
+
+        assert code == cli_module.EXIT_PROFILE
+        assert "already exists" in capsys.readouterr().err
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_yes_skips_the_confirmation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(tmp_path)
+        self._feed(monkeypatch, ["2.20.0", HASH])
+
+        code = main(["profile", "add", "--profile", str(path), "--yes"])
+
+        assert code == 0
+        assert path.exists()
+
+
+# --------------------------------------------------------------------------
+# interactive menu (no arguments on a TTY)
+# --------------------------------------------------------------------------
+
+
+class _FakeTTY(io.StringIO):
+    """A stream that claims to be an interactive terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class TestInteractiveMenu:
+    def _run(
+        self, monkeypatch: pytest.MonkeyPatch, answers: list[str]
+    ) -> tuple[int, str]:
+        """Feed ``answers`` to the menu and return (exit code, stdout)."""
+        items = iter(answers)
+        out = io.StringIO()
+
+        def fake_input(prompt: str = "") -> str:
+            try:
+                return next(items)
+            except StopIteration:
+                raise EOFError from None
+
+        monkeypatch.setattr("builtins.input", fake_input)
+        monkeypatch.setattr(cli_module.sys, "stdin", _FakeTTY())
+        real_stdout = cli_module.sys.stdout
+        monkeypatch.setattr(cli_module.sys, "stdout", out)
+        try:
+            code = main([])
+        finally:
+            monkeypatch.setattr(cli_module.sys, "stdout", real_stdout)
+        return code, out.getvalue()
+
+    def test_menu_is_shown_without_arguments(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code, out = self._run(monkeypatch, ["q"])
+
+        assert code == cli_module.EXIT_USAGE
+        assert "choose an action" in out
+        for label in ("sync", "check", "dry-run", "list-types", "profile-add"):
+            assert label in out
+
+    def test_quit_leaves_no_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "vp.json"
+        self._run(monkeypatch, ["q"])
+
+        assert not path.exists()
+
+    def test_rejects_an_invalid_choice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        code, out = self._run(monkeypatch, ["99", "q"])
+
+        assert code == cli_module.EXIT_USAGE
+        assert "invalid choice" in out
+
+    def test_profile_add_flow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "vp.json"
+        code, _ = self._run(
+            monkeypatch,
+            ["5", str(path), "2.20.0", HASH, "2.20.0", "y"],
+        )
+
+        assert code == 0
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["profiles"]["2.20.0"]["versionHash"] == HASH
+
+    def test_profile_add_rejects_a_bad_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "vp.json"
+        code, _ = self._run(monkeypatch, ["5", str(path), "2.20.0", "not-a-hash"])
+
+        assert code == cli_module.EXIT_USAGE
+        assert not path.exists()
+
+    def test_list_types_asks_for_a_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(tmp_path)
+        calls: dict[str, object] = {}
+
+        def fake_discover(client, version, **kwargs):
+            calls.update(kwargs)
+            return [], {}
+
+        class _Client:
+            def __init__(self, **kwargs: object) -> None: ...
+
+            def __enter__(self) -> _Client:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+        monkeypatch.setattr(cli_module, "HttpClient", _Client)
+        monkeypatch.setattr(cli_module, "discover_catalog_tree", fake_discover)
+
+        code, _ = self._run(
+            monkeypatch,
+            ["4", str(tmp_path / "out"), str(path), "2.20.0", HASH],
+        )
+
+        assert code == 0
+        assert calls["writable"] is False
+
+    def test_sync_flow_reaches_the_downloader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(tmp_path)
+        seen: dict[str, object] = {}
+
+        def fake_sync(*args: object, **kwargs: object) -> object:
+            seen.update(kwargs)
+            from prism_sync.models import SyncOutcome, VersionCheck
+
+            check = VersionCheck(
+                game_version="2.20.0",
+                remote_resource_version="20006500@Y/Hfn4F3ipto1cz9Xl5Djro=",
+                remote_simple="20006500",
+                local=None,
+                up_to_date=True,
+                reason="up to date",
+            )
+            return SyncOutcome(check=check, result=None, marker_written=False)
+
+        monkeypatch.setattr(cli_module, "sync_if_needed", fake_sync)
+
+        class _Client:
+            def __init__(self, **kwargs: object) -> None: ...
+
+            def __enter__(self) -> _Client:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+        monkeypatch.setattr(cli_module, "HttpClient", _Client)
+
+        code, _ = self._run(
+            monkeypatch,
+            ["1", str(tmp_path / "out"), str(path), "2.20.0", HASH],
+        )
+
+        assert code == 0
+        assert seen.get("game_version") == "2.20.0"
+
+    def test_script_stdin_still_prints_help(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A non-TTY stdin must keep the old help output."""
+        code = main([])
+
+        assert code == cli_module.EXIT_USAGE
+        assert "usage: prism-sync" in capsys.readouterr().err
+
+
+class TestProjectRootDefaults:
+    """Menu defaults point at the project root, not the process cwd."""
+
+    def test_output_default_is_absolute_under_project_root(self) -> None:
+        from prism_sync.version import project_root
+
+        default = cli_module._default_output_dir()
+
+        assert Path(default).is_absolute()
+        assert Path(default) == project_root() / "assets"
+
+    def test_profile_default_is_absolute_under_project_root(self) -> None:
+        from prism_sync.version import project_root
+
+        default = cli_module._default_profile_path()
+
+        assert Path(default).is_absolute()
+        assert Path(default) == project_root() / "version_profiles.json"
+
+    def test_cwd_does_not_affect_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = cli_module._default_output_dir()
+        monkeypatch.chdir(tmp_path)
+
+        assert cli_module._default_output_dir() == before
+
+
+class TestExistingResourceNotes:
+    def test_missing_output_dir_has_no_note(self, tmp_path: Path) -> None:
+        assert cli_module._describe_existing_output(tmp_path / "absent") is None
+
+    def test_empty_output_dir_is_reported(self, tmp_path: Path) -> None:
+        (tmp_path / "empty").mkdir()
+
+        note = cli_module._describe_existing_output(tmp_path / "empty")
+
+        assert note is not None and "empty" in note
+
+    def test_populated_output_dir_is_reported(self, tmp_path: Path) -> None:
+        target = tmp_path / "used"
+        target.mkdir()
+        (target / "keep.txt").write_text("x", encoding="utf-8")
+
+        note = cli_module._describe_existing_output(target)
+
+        assert note is not None and "not empty" in note
+
+    def test_previous_sync_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "synced"
+        target.mkdir()
+        (target / "sync-state.json").write_text(
+            json.dumps(
+                {"resourceVersion": "20006500@Y/abc=", "files": {"a.txt": {"size": 1}}}
+            ),
+            encoding="utf-8",
+        )
+
+        note = cli_module._describe_existing_output(target)
+
+        assert note is not None
+        assert "1 recorded files" in note
+        assert "20006500@Y/abc=" in note
+
+    def test_unreadable_state_is_reported(self, tmp_path: Path) -> None:
+        target = tmp_path / "broken"
+        target.mkdir()
+        (target / "sync-state.json").write_text("{bad", encoding="utf-8")
+
+        note = cli_module._describe_existing_output(target)
+
+        assert note is not None and "unreadable" in note
+
+    def test_existing_profiles_are_listed(self, tmp_path: Path) -> None:
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "b",
+                "profiles": {
+                    "a": {"gameVersion": "1", "versionHash": OTHER_HASH},
+                    "b": {"gameVersion": "2", "versionHash": HASH},
+                },
+            },
+        )
+        console = cli_module.Console(quiet=True, stream=io.StringIO())
+
+        note = cli_module._describe_existing_profile(path, console)
+
+        assert note is not None
+        assert "2 profile(s)" in note
+        assert "a, b" in note
+
+    def test_missing_profiles_file_has_no_note(self, tmp_path: Path) -> None:
+        console = cli_module.Console(quiet=True, stream=io.StringIO())
+
+        assert (
+            cli_module._describe_existing_profile(tmp_path / "absent.json", console)
+            is None
+        )
+
+
+class TestMenuCancellation:
+    """Cancelling returns to the menu; only ``q`` leaves."""
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> int:
+        items = iter(answers)
+
+        def fake_input(prompt: str = "") -> str:
+            try:
+                return next(items)
+            except StopIteration:
+                raise EOFError from None
+
+        # Do not read the developer's own profile from the repository root.
+        monkeypatch.setattr(
+            cli_module, "_default_profile_path", lambda: "/nonexistent/vp.json"
+        )
+        monkeypatch.setattr(
+            cli_module, "_default_output_dir", lambda: "/nonexistent/assets"
+        )
+        monkeypatch.setattr("builtins.input", fake_input)
+        monkeypatch.setattr(cli_module.sys, "stdin", _FakeTTY())
+        monkeypatch.setattr(cli_module.sys, "stdout", io.StringIO())
+        return main([])
+
+    def test_cancel_returns_to_menu(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """An empty gameVersion does not kill the session."""
+        code = self._run(monkeypatch, ["2", str(tmp_path / "out"), "", "", "q"])
+
+        assert code == cli_module.EXIT_USAGE
+        err = capsys.readouterr().err
+        assert "no gameVersion is known yet" in err
+        assert "back to the menu" in err
+
+    def test_repeats_after_cancel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After cancelling, a second choice is still possible."""
+        (tmp_path / "out").mkdir()
+        monkeypatch.setattr(
+            cli_module,
+            "_menu_pick",
+            lambda: "list_types",
+        )
+        calls: list[int] = []
+
+        def fake_list(output: object, profile: object, console: object) -> int:
+            calls.append(1)
+            return 0
+
+        monkeypatch.setattr(cli_module, "run_list_types", fake_list)
+        monkeypatch.setattr(
+            cli_module,
+            "_menu_ask_profile",
+            lambda *a, **k: None,  # always cancelled
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "_menu_pick",
+            iter(["list_types", "list_types", None]).__next__,
+        )
+        monkeypatch.setattr(cli_module, "_ask", lambda *a, **k: str(tmp_path))
+
+        code = self._run(monkeypatch, [])
+
+        assert code == cli_module.EXIT_USAGE
+        assert calls == [], "a cancelled action must not run the command"
+
+    def test_missing_version_explains_why(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """With no stored version the prompt says it is required."""
+        sink = io.StringIO()
+        console = cli_module.Console(stream=sink)
+        items = iter(["", HASH])
+        monkeypatch.setattr("builtins.input", lambda p="": next(items, None))
+
+        result = cli_module._menu_ask_profile(console, str(tmp_path / "vp.json"))
+
+        assert result is None
+        err = sink.getvalue()
+        assert "no gameVersion is known yet" in err
+        assert "back to the menu" in err
+
+    def test_stored_version_is_offered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.19.1",
+                "profiles": {"2.19.1": {"gameVersion": "2.19.1", "versionHash": HASH}},
+            },
+        )
+        console = cli_module.Console(quiet=True, stream=io.StringIO())
+        items = iter(["", "1"])
+        monkeypatch.setattr("builtins.input", lambda p="": next(items, None))
+
+        result = cli_module._menu_ask_profile(console, str(path))
+
+        assert result is not None
+        assert result.game_version == "2.19.1"
+        assert result.version_hash == HASH
+
+
+class TestMenuPersistsProfile:
+    """Values typed in the menu are offered to be saved."""
+
+    def test_saves_a_new_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "vp.json"
+        sink = io.StringIO()
+        console = cli_module.Console(stream=sink)
+        monkeypatch.setattr("builtins.input", lambda p="": "y")
+
+        cli_module._offer_profile_save(
+            console,
+            str(path),
+            _profile_file(tmp_path) and cli_module.VersionProfile("2.20.0", HASH),
+        )
+
+        assert path.is_file()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["profiles"]["2.20.0"]["versionHash"] == HASH
+        assert data["default"] == "2.20.0"
+
+    def test_declining_keeps_no_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "vp.json"
+        console = cli_module.Console(quiet=True, stream=io.StringIO())
+        monkeypatch.setattr("builtins.input", lambda p="": "n")
+
+        cli_module._offer_profile_save(
+            console, str(path), cli_module.VersionProfile("2.20.0", HASH)
+        )
+
+        assert not path.exists()
+
+    def test_keeps_existing_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.19.1",
+                "profiles": {
+                    "2.19.1": {"gameVersion": "2.19.1", "versionHash": OTHER_HASH}
+                },
+            },
+        )
+        console = cli_module.Console(quiet=True, stream=io.StringIO())
+        monkeypatch.setattr("builtins.input", lambda p="": "y")
+
+        cli_module._offer_profile_save(
+            console, str(path), cli_module.VersionProfile("2.20.0", HASH)
+        )
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["profiles"]["2.19.1"]["versionHash"] == OTHER_HASH
+        assert data["profiles"]["2.20.0"]["versionHash"] == HASH
+        assert data["default"] == "2.19.1"
+
+    def test_same_hash_is_not_rewritten(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.20.0",
+                "profiles": {"2.20.0": {"gameVersion": "2.20.0", "versionHash": HASH}},
+            },
+        )
+        before = path.read_text(encoding="utf-8")
+        sink = io.StringIO()
+        console = cli_module.Console(stream=sink)
+
+        cli_module._offer_profile_save(
+            console, str(path), cli_module.VersionProfile("2.20.0", HASH)
+        )
+
+        assert path.read_text(encoding="utf-8") == before
+        assert "save this profile" not in sink.getvalue()
+
+    def test_conflicting_hash_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _profile_file(
+            tmp_path,
+            {
+                "default": "2.20.0",
+                "profiles": {
+                    "2.20.0": {"gameVersion": "2.20.0", "versionHash": OTHER_HASH}
+                },
+            },
+        )
+        before = path.read_text(encoding="utf-8")
+        sink = io.StringIO()
+        console = cli_module.Console(stream=sink)
+
+        cli_module._offer_profile_save(
+            console, str(path), cli_module.VersionProfile("2.20.0", HASH)
+        )
+
+        assert path.read_text(encoding="utf-8") == before
+        assert "different hash" in sink.getvalue()
